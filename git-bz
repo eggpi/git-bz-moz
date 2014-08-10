@@ -1208,7 +1208,13 @@ class Bug(object):
         self.token = None if token is None else token.text
 
         for attachment in bug.findall("attachment"):
-            if attachment.get("ispatch") == "1" and not attachment.get("isobsolete") == "1" :
+            # XXX(ggp) BMO ignores the ispatch flag for pull request attachments:
+            # https://github.com/mozilla/webtools-bmo-bugzilla/blob/612ab3f/extensions/BMO/Extension.pm#L630
+            # so we need to check for the mime type here to make sure PRs are recognized as existing patches.
+            # Special-casing the mimetype seems to also be their solution to this, as per bug 917878.
+            type = attachment.find("type").text
+            ispatch = attachment.get("ispatch") or type == "text/x-github-pull-request"
+            if ispatch and not attachment.get("isobsolete") == "1" :
                 attach_id = int(attachment.find("attachid").text)
                 patch = BugPatch(attach_id)
                 # We have to save fields we might not otherwise care about
@@ -1320,7 +1326,9 @@ class Bug(object):
         print "Bug %d - %s" % (self.id, short_desc)
         print self.get_url()
 
-    def create_patch(self, description, comment, filename, data, obsoletes=[], status='none', review=[], superreview=[], feedback=[], ui_review=[]):
+    def create_patch(self, description, comment, filename, data, obsoletes=[],
+            status='none', review=[], superreview=[], feedback=[], ui_review=[],
+            mime = 'text/plain; charset=UTF-8'):
         fields = {}
         fields['bugid'] = str(self.id)
         token = self.get_attachment_token()
@@ -1370,7 +1378,7 @@ class Bug(object):
                 fields['flag_type-%d' % ui_review_flag] = '?'
                 fields['requestee_type-%d' % ui_review_flag] = ",".join(ui_review)
 
-        files = { 'data': (filename, 'text/plain; charset=UTF-8', data) }
+        files = { 'data': (filename, mime, data) }
 
         response = self.server.send_post("/attachment.cgi", fields, files)
         response_data = response.read()
@@ -1958,6 +1966,26 @@ def do_attach(*args):
 
     attach_commits(bug, commits, edit=global_options.edit)
 
+def do_attach_github_pr(*args):
+    bug_reference = args[0]
+    pr_url = args[1]
+
+    handle = BugHandle.parse_or_die(bug_reference)
+    bug = Bug.load(handle)
+
+    description = 'GitHub pull request'
+    comment = commit_message = commit_body = ''
+    obsoletes = review = superreview = feedback = ui_review = []
+    if global_options.edit:
+        description, comment, commit_message, commit_body, obsoletes, \
+        review, superreview, feedback, ui_review = \
+            edit_attachment_comment(bug, description, commit_body, comment)
+
+    bug.create_patch(
+        description, comment, pr_url, pr_url, obsoletes=obsoletes,
+        status='none', review=review, superreview=superreview, feedback=feedback,
+        ui_review=ui_review, mime = 'text/x-github-pull-request')
+
 # Sort the patches in the bug into categories based on a set of Git
 # git commits that we're considering to be newly applied. Matching
 # is done on exact git subject <=> patch description matches.
@@ -2517,8 +2545,12 @@ elif command == 'push':
                       help="allow non-fast-forward commits")
     min_args = 0
     max_args = 1000 # no max
+elif command == 'pr':
+    parser.set_usage("git bz pr <bug reference> <GitHub pull request>")
+    add_edit_option()
+    min_args = max_args = 2
 else:
-    print >>sys.stderr, "Usage: git bz [add-url|apply|attach|components|edit|file|push] [options]"
+    print >>sys.stderr, "Usage: git bz [add-url|apply|attach|components|edit|file|push|pr] [options]"
     sys.exit(1)
 
 global_options, args = parser.parse_args()
@@ -2546,5 +2578,7 @@ elif command == 'file':
     do_file(*args)
 elif command == 'push':
     do_push(*args)
+elif command == 'pr':
+    do_attach_github_pr(*args)
 
 sys.exit(0)
